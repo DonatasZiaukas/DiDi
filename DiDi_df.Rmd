@@ -1,0 +1,551 @@
+---
+title: "DiDi_data"
+author: "D.Z"
+date: "11/07/2016"
+output: html_document
+---
+
+
+
+```{r, echo=FALSE}
+library(dplyr)
+library(tidyr)
+library(data.table)
+library(feather)
+library(tools)
+#library(moments)  # check skewness/kurtosis  
+library(lubridate) # time feature wrangling
+
+```
+
+
+``` {r TRAIN, echo=FALSE}
+
+
+#bind files together
+setwd('~/data/season_2/training_data')
+path = '~/data/season_2/training_data'
+folders = list.files()
+#poi_data requires separate attention              poi <- read.csv("poi_data.csv",sep="\t",header=F)
+folders = folders[folders != "poi_data"]
+for(i in 1:length(folders)){
+  temp0 = paste(path,folders[i], sep="/")
+  setwd(temp0)
+  #original file are plain text documents
+  #change to csv files
+  l <- list.files()
+  lapply(l, function(x)file.rename(x,paste(x,'.csv',sep="")))
+  ls.names = list.files(pattern="*.csv")
+  #reverse solution, if extension removal desired
+#  lapply(l, function(x)file.rename(x,file_path_sans_ext(x)))
+  assign(folders[i],do.call(rbind, lapply(ls.names, function(x)fread(x, header=F))))
+    
+}
+#name features
+colnames(cluster_map) <- c("district_hash","district_id")
+colnames(order_data) <- c("order_id","driver_id","passenger_id","start_district_hash",
+                 "dest_district_hash","Price","Time")
+#colnames(poi_data) <- c("district_hash","poi_class")
+colnames(traffic_data) <- c("district_hash","level1","level2","level3","level4","Time")
+colnames(weather_data) <- c("Time","Weather","temperature","PM2.5")
+
+
+
+#construct features date,time,wday,Time_slot
+TimeFunc <- function(x) x %>% separate(Time,into = c("date","time"), sep=" ") %>%
+  mutate(time_slot=ceiling(period_to_seconds(hms(time))/600),wday = as.POSIXlt(date)$wday) %>%
+  unite(Time_slot,date,time_slot,remove=F,sep="-") %>% 
+  mutate(date = as.Date(date)) %>%
+  select(-time) %>% rename(time=time_slot)
+
+order_data   <- TimeFunc(order_data)
+traffic_data <- TimeFunc(traffic_data)
+weather_data <- TimeFunc(weather_data)
+
+
+
+#weather_data dimension should be 21*144=3024
+#replace duplicate rows with medians
+
+weather_data <- data.frame(weather_data)
+weather_data <- weather_data %>% group_by(Time_slot) %>% summarise(Weather = median(Weather),
+                                                                   temperature = median(temperature),
+                                                                   PM2.5 = median(PM2.5))
+
+
+#ADD empty rows with missing time_slots
+fullTime_slot <- order_data[!duplicated(order_data$Time_slot),] %>% select(Time_slot)
+weather <- full_join(fullTime_slot,weather_data, by="Time_slot")
+
+#separate again Time_slot into date and time
+weather <- weather %>% separate(Time_slot,into=c("date","time"),remove=F,sep=10)
+weather$time <- gsub("-","",weather$time)
+weather$wday <- as.POSIXlt(weather$date)$wday
+weather$date <- as.Date(weather$date)
+weather$time <- as.numeric(weather$time)
+
+weather      <- arrange(weather,date,time)
+
+#####################################################################
+#replace NA's with nearest values
+f1 <- function(dat) {
+  N <- length(dat)
+  na.pos <- which(is.na(dat))
+  if (length(na.pos) %in% c(0, N)) {
+    return(dat)
+  }
+  non.na.pos <- which(!is.na(dat))
+  intervals  <- findInterval(na.pos, non.na.pos,
+                             all.inside = TRUE)
+  left.pos   <- non.na.pos[pmax(1, intervals)]
+  right.pos  <- non.na.pos[pmin(N, intervals+1)]
+  left.dist  <- na.pos - left.pos
+  right.dist <- right.pos - na.pos
+
+  dat[na.pos] <- ifelse(left.dist <= right.dist,
+                        dat[left.pos], dat[right.pos])
+  return(dat)
+}
+#####################################################################
+weather <- weather %>% group_by(date) %>% mutate_each(funs(f1),-c(Time_slot,date,time,wday))
+weather <- data.frame(weather)
+#FINISHED with weather_data!!
+
+#now traffic...  desired number of rows 21*144*66=199584
+
+#map district_id's
+traffic <- right_join(cluster_map,traffic_data, by="district_hash") %>% select(-district_hash) 
+
+#add districts to fullTime_slot data
+
+temp <- fullTime_slot
+temp$district_id <- 1
+x <- temp
+for(i in 2:66){
+  temp$district_id <- i
+  x <- bind_rows(x,temp)
+}
+fullTimeAndDistrict <- data.frame(x)
+#construct ID feature
+fullTimeAndDistrict <- unite(fullTimeAndDistrict,ID,district_id,Time_slot,remove=F,sep="-")
+traffic <- unite(traffic,ID,district_id,Time_slot,remove=F,sep="-")
+#convert traffic level features: Ex."1:231" ->key=1, value=231 
+traffic <- separate(traffic, level1, into = c("L1", "V1"), sep=":")
+traffic <- separate(traffic, level2, into = c("L2", "V2"), sep=":")
+traffic <- separate(traffic, level3, into = c("L3", "V3"), sep=":")
+traffic <- separate(traffic, level4, into = c("L4", "V4"), sep=":")
+
+traffic <- select(traffic,ID,V1,V2,V3,V4)
+traffic <- full_join(fullTimeAndDistrict,traffic, by="ID")
+traffic <- mutate(traffic,T1=as.numeric(V1),T2=as.numeric(V2),T3=as.numeric(V3),T4=as.numeric(V4)) %>%
+  select(-c(V1,V2,V3,V4))
+traffic <- separate(traffic,Time_slot,into=c("date","time"),remove=F,sep=10)
+traffic$time <- gsub("-","",traffic$time)
+traffic$wday <- as.POSIXlt(traffic$date)$wday
+traffic$date <- as.Date(traffic$date)
+traffic$time <- as.numeric(traffic$time)
+traffic <- arrange(traffic,district_id,date,time)
+
+#NA check
+fnd_NAs_traffic <- traffic[rowSums(is.na(traffic)) > 0,] #nrow-> 6031
+
+#> nrow(fnd_NAs_traffic[fnd_NAs_traffic$district_id == 54,])
+#[1] 3024
+#district 54 has no recorded traffic data
+d54 <- traffic %>% group_by(time) %>% mutate(T1 = ifelse(is.na(T1), median(T1, na.rm=T),T1),
+                                             T2 = ifelse(is.na(T2), median(T2, na.rm=T),T2),
+                                             T3 = ifelse(is.na(T3), median(T3, na.rm=T),T3),
+                                             T4 = ifelse(is.na(T4), median(T4, na.rm=T),T4)) %>% ungroup()
+#b = ifelse(is.na(b), mean(b, na.rm = T), b)
+#> nrow(fnd_NAs_traffic[fnd_NAs_traffic$time == 1,])
+#[1] 1386
+#> nrow(fnd_NAs_traffic[fnd_NAs_traffic$time == 3,])
+#[1] 1386
+#time 1 and 3 has no recorded traffic data
+
+#replace time=1 with nearest value
+traffic <- d54 %>% mutate_each(funs(f1))
+traffic <- data.frame(traffic)
+#TRAFFIC DATA READY!!
+
+#order_data
+
+#remove rows with order_id duplicates
+order_data <- order_data[!duplicated(order_data$order_id),]
+
+#add district_0 for unknown destinations 
+district_hash <- c("NA")
+district_id <- c(0)
+district_0 <- data.frame(district_hash,district_id)
+cluster_map0 <- bind_rows(district_0,cluster_map)
+
+#replace start and destination district_hash with district_id
+order_data <- rename(order_data,district_hash=start_district_hash)
+order_data <- left_join(cluster_map,order_data, by=c("district_hash"))
+order_data <- rename(order_data,start_district_id=district_id)
+
+#replace unknown dest_districts with character NA
+order_data$dest_district_hash[!order_data$dest_district_hash %in% cluster_map0$district_hash] <- "NA"
+order_data <- order_data %>% select(-district_hash) %>% rename(district_hash=dest_district_hash)
+order_data <- left_join(cluster_map0,order_data, by=c("district_hash"))
+order_data <- order_data %>% rename(dest_district_id=district_id) %>%
+  select(-district_hash)
+
+
+
+#oreder_result -> passenger request answered(1), not answered(0)
+order_data$order_result <- 0
+order_data$order_result[order_data$driver_id != "NULL"] <- 1
+
+#add feature isLocal -> is destination same district,
+#Output: if local 0, else 1 
+order_data$isLocal <- 0
+order_data$isLocal[order_data$start_district_id != order_data$dest_district_id] <- 1
+
+#construct ID column as district_id-Time_slot, remove order_id
+order_data <- order_data %>% select(-order_id) %>%
+  unite(ID,start_district_id,Time_slot,remove=F,sep="-")
+
+
+#psgLuck -> answered orders/total orders by passenger_id
+passenger <- order_data %>% group_by(passenger_id) %>% summarise(psgLuck = sum(order_result)/n())
+order_data <- left_join(order_data,passenger, by="passenger_id")
+
+
+order_data <- order_data %>% arrange(start_district_id,date,time)
+
+#group data by ID
+group_order_data <- order_data %>% group_by(ID) %>% summarise(ord_cnt = n(),
+                                                     district_id = median(start_district_id),
+                                                     time = median(time),
+                                                     Time_slot = first(Time_slot),
+                                                     wday = median(wday),
+                                                     date = median(date),
+                                                     gap = n() - sum(order_result),
+                                                     psg_goodness = mean(psgLuck),  #rename to psg_success_rate                      
+                                                     NotLocal = sum(isLocal),                                                                                                    
+                                                     ord_ratio =sum(order_result)/n(),
+                                                     avg_Prc = median(Price)) %>%
+  
+                                                     mutate(NotLocal_ratio = NotLocal/ord_cnt)
+
+
+
+group_order_data$Time_slot <- as.factor(group_order_data$Time_slot)
+#> 66*21*144-nrow(group_order_data)
+#[1] 36091 ID's with zero atempts to book a driver
+fullTimeAndDistrict$ord_cnt       <- 0
+fullTimeAndDistrict$gap           <- 0
+fullTimeAndDistrict$psg_goodness  <- mean(group_order_data$psg_goodness)
+fullTimeAndDistrict$NotLocal      <- 0
+fullTimeAndDistrict$NotLocal_ratio     <- mean(group_order_data$NotLocal_ratio)
+fullTimeAndDistrict$ord_ratio     <- mean(group_order_data$ord_ratio)
+fullTimeAndDistrict$avg_Prc       <- mean(group_order_data$avg_Prc)
+fullTimeAndDistrict <- fullTimeAndDistrict %>% separate(Time_slot,into=c("date","time"),remove=F,sep=10)
+fullTimeAndDistrict$time <- gsub("-","",fullTimeAndDistrict$time)
+fullTimeAndDistrict$wday <- as.POSIXlt(fullTimeAndDistrict$date)$wday
+fullTimeAndDistrict$date <- as.Date(fullTimeAndDistrict$date)
+fullTimeAndDistrict$time <- as.numeric(fullTimeAndDistrict$time)
+#select rows that not present in group_order_data
+
+NoOrders <- fullTimeAndDistrict[!fullTimeAndDistrict$ID %in% group_order_data$ID,]
+
+full_order_data <- rbind(group_order_data,NoOrders) %>% arrange(district_id,date,time)
+
+full_order_data <- data.frame(full_order_data)
+
+##build features: driversArriving -> number of driver_id's with dest_district_id matching district_id to be predicted,
+##                                   only in the last 30 min before prediction                          
+##                driversArrived  -> count driversArriving that match start_district_id
+##
+temp <- data.frame(ID = NA, driversArriving = NA)
+for(i in unique(order_data$date)){  
+order_data1 <- filter(order_data,date==i)
+ID <- unique(order_data1$ID)
+
+driversArriving <-  sapply(ID, 
+function(x, y) nrow(y %>% 
+                          filter(
+                          time < filter(y, ID == x)$time[1] & 
+                          time > filter(y, ID == x)$time[1]-3 & 
+                          dest_district_id == filter(y, ID == x)$start_district_id[1] &
+                          driver_id != "NULL")),y=order_data1,USE.NAMES = FALSE)
+df    <- cbind(ID,driversArriving)
+temp  <- rbind(temp,data.frame(df))
+}
+temp <- na.omit(temp)
+drvA <- temp
+
+#for data points with past half-hour occuring before and after midnight
+temp <- data.frame(ID = NA, driversArriving = NA)
+for(i in unique(order_data$date)){ 
+
+beforemidnight <- filter(order_data,date == i & time > 141)  
+aftermidnight <- filter(order_data,date == i+1 & time < 4)
+ID <- unique(aftermidnight$ID)
+
+
+driversArriving <-  sapply(ID, 
+function(x, y) nrow(y %>% 
+                          filter(
+                          time >= 141 + as.numeric(last(unlist(strsplit(x,"-")))) & 
+                          dest_district_id == as.numeric(first(unlist(strsplit(x,"-")))) &
+                          driver_id != "NULL")),y=beforemidnight,USE.NAMES = FALSE)
+df    <- cbind(ID,driversArriving)
+temp  <- rbind(temp,data.frame(df))
+}
+
+temp <- na.omit(temp)
+
+drvA$driversArriving <- as.numeric(drvA$driversArriving)
+temp$driversArriving <- as.numeric(temp$driversArriving)
+
+#use dataframe fullTimeAndDistrict    
+
+fullTimeAndDistrict$driversArriving <- 0
+
+fullTimeAndDistrict <- select(fullTimeAndDistrict,-c(Time_slot,district_id))
+df <- full_join(fullTimeAndDistrict,drvA, by="ID") 
+df[is.na(df)] <- 0
+df <- df %>% mutate(driversArriving = driversArriving.x + driversArriving.y) %>%
+  select(ID,driversArriving)
+df <- full_join(df,temp,by="ID")
+df[is.na(df)] <- 0
+df <- df %>% mutate(driversArriving = driversArriving.x + driversArriving.y) %>%
+  select(ID,driversArriving)
+
+driversArriving <- data.frame(df)
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~
+#driversArrived   
+
+temp <- data.frame(ID = NA, driversArrived = NA)
+for(i in unique(order_data$date)){
+order_data1 <- filter(order_data,date==i)
+ID <- unique(order_data1$ID) 
+
+driversArrived <-  sapply(ID, 
+function(x, y) length(which(filter(y, ID == x)$driver_id %in%
+                          filter(y, 
+                          time < filter(y, ID == x)$time[1] & 
+                          time > filter(y, ID == x)$time[1]-3 & 
+                          dest_district_id == filter(y, ID == x)$start_district_id[1] &
+                          driver_id != "NULL")$driver_id)),y=order_data1,USE.NAMES = FALSE)
+df    <- cbind(ID,driversArrived)
+temp  <- rbind(temp,data.frame(df))
+}
+temp <- na.omit(temp)
+driversArrived <- temp
+
+temp <- data.frame(ID = NA, driversArrived = NA)
+for(i in unique(order_data$date)){  
+
+beforemidnight <- filter(order_data,date == i & time > 141)  
+aftermidnight <- filter(order_data,date == i+1 & time < 4)
+ID <- unique(aftermidnight$ID)
+
+driversArrived <-  sapply(ID, 
+function(x, y) length(which(filter(y, ID == x)$driver_id %in%
+                          filter(y,
+                          time >= 141 + as.numeric(last(unlist(strsplit(x,"-")))) & 
+                          dest_district_id == as.numeric(first(unlist(strsplit(x,"-")))) &
+                          driver_id != "NULL"))),y=beforemidnight,USE.NAMES = FALSE)
+df    <- cbind(midnightID,driversArrived)
+temp  <- rbind(temp,data.frame(df))
+}
+
+temp <- temp %>%  mutate(driversArrived = as.numeric(driversArrived))
+temp <- na.omit(temp)
+
+driversArrived$driversArrived <- as.numeric(driversArrived$driversArrived)
+
+fullTimeAndDistrict$driversArrived <- 0
+fullTimeAndDistrict <- select(fullTimeAndDistrict,ID,driversArrived)
+df <- full_join(fullTimeAndDistrict,driversArrived, by="ID") 
+df[is.na(df)] <- 0
+df <- df %>% mutate(driversArrived = driversArrived.x + driversArrived.y) %>%
+  select(ID,driversArrived)
+df <- full_join(df,temp,by="ID")
+df[is.na(df)] <- 0
+driversArrived <- df %>% mutate(driversArrived = driversArrived.x + driversArrived.y) %>%
+  select(ID,driversArrived)
+
+driversArrived <- data.frame(driversArrived)
+
+
+#merge data frames in to one
+train <- left_join(full_order_data,driversArriving, by = "ID")
+train <- left_join(train,driversArrived, by = "ID")    
+train <- left_join(train,select(weather,Time_slot,Weather,temperature,PM2.5), by = "Time_slot")
+train <- left_join(train,select(traffic,ID,T1, T2, T3, T4), by = "ID")
+train$date <- as.Date(train$date)
+
+train <- train %>% mutate(sumT=T1+T2+T3+T4) %>%
+  mutate(T1ratio = T1/sumT,
+         T2ratio = T2/sumT,
+         T3ratio = T3/sumT,
+         T4ratio = T4/sumT)
+
+
+#build features representing past half-hour
+TRAIN <- train %>% group_by(district_id,date) %>%
+
+  mutate(#gap
+         gap10minAgo=c(gap[1],head(gap,-1)),
+         gap20minAgo=c(gap[1],gap[2],head(gap,-2)),
+         gap30minAgo=c(gap[1],gap[2],gap[3],head(gap,-3)),
+         #ord_cnt
+         ordCnt10minAgo=c(ord_cnt[1],head(ord_cnt,-1)),
+         ordCnt20minAgo=c(ord_cnt[1],ord_cnt[2],head(ord_cnt,-2)),
+         ordCnt30minAgo=c(ord_cnt[1],ord_cnt[2],ord_cnt[3],head(ord_cnt,-3)),
+         #NotLocal
+         NotLocal10minAgo=c(NotLocal[1],head(NotLocal,-1)),
+         NotLocal20minAgo=c(NotLocal[1],NotLocal[2],head(NotLocal,-2)),
+         NotLocal30minAgo=c(NotLocal[1],NotLocal[2],NotLocal[3],head(NotLocal,-3)),
+         #NotLocal_ratio
+         NotLocal_ratio10minAgo=c(NotLocal_ratio[1],head(NotLocal_ratio,-1)),
+         NotLocal_ratio20minAgo=c(NotLocal_ratio[1],NotLocal_ratio[2],head(NotLocal_ratio,-2)),
+         NotLocal_ratio30minAgo=c(NotLocal_ratio[1],NotLocal_ratio[2],NotLocal_ratio[3],head(gap,-3)),
+         #psg_goodness
+         psg_goodness10minAgo=c(psg_goodness[1],head(psg_goodness,-1)),
+         psg_goodness20minAgo=c(psg_goodness[1],psg_goodness[2],head(psg_goodness,-2)),
+         psg_goodness30minAgo=c(psg_goodness[1],psg_goodness[2],psg_goodness[3],head(psg_goodness,-3)),
+
+         #ord_ratio
+         ord_ratio10minAgo=c(ord_ratio[1],head(ord_ratio,-1)),
+         ord_ratio20minAgo=c(ord_ratio[1],ord_ratio[2],head(ord_ratio,-2)),
+         ord_ratio30minAgo=c(ord_ratio[1],ord_ratio[2],ord_ratio[3],head(ord_ratio,-3)),
+         #avg_Price
+         avg_Prc10minAgo=c(avg_Prc[1],head(avg_Prc,-1)),
+         avg_Prc20minAgo=c(avg_Prc[1],avg_Prc[2],head(avg_Prc,-2)),
+         avg_Prc30minAgo=c(avg_Prc[1],avg_Prc[2],avg_Prc[3],head(avg_Prc,-3)),
+         #traffic level1
+         T1_10minAgo=c(T1[1],head(T1,-1)),
+         T1_20minAgo=c(T1[1],T1[2],head(T1,-2)),
+         T1_30minAgo=c(T1[1],T1[2],T1[3],head(T1,-3)),
+         #traffic level2
+         T2_10minAgo=c(T2[1],head(T2,-1)),
+         T2_20minAgo=c(T2[1],T2[2],head(T2,-2)),
+         T2_30minAgo=c(T2[1],T2[2],T2[3],head(T2,-3)),
+         #traffic level3
+         T3_10minAgo=c(T3[1],head(T3,-1)),
+         T3_20minAgo=c(T3[1],T3[2],head(T3,-2)),
+         T3_30minAgo=c(T3[1],T3[2],T3[3],head(T3,-3)),
+         #traffic level4
+         T4_10minAgo=c(T4[1],head(T4,-1)),
+         T4_20minAgo=c(T4[1],T4[2],head(T4,-2)),
+         T4_30minAgo=c(T4[1],T4[2],T4[3],head(T4,-3)),
+         #traffic ratio level1
+         T1ratio_10minAgo=c(T1ratio[1],head(T1ratio,-1)),
+         T1ratio_20minAgo=c(T1ratio[1],T1ratio[2],head(T1ratio,-2)),
+         T1ratio_30minAgo=c(T1ratio[1],T1ratio[2],T1ratio[3],head(T1ratio,-3)),
+         #traffic ratio level2
+         T2ratio_10minAgo=c(T2ratio[1],head(T2ratio,-1)),
+         T2ratio_20minAgo=c(T2ratio[1],T2ratio[2],head(T2ratio,-2)),
+         T2ratio_30minAgo=c(T2ratio[1],T2ratio[2],T2ratio[3],head(T2ratio,-3)),
+         #traffic ratio level3
+         T3ratio_10minAgo=c(T3ratio[1],head(T3ratio,-1)),
+         T3ratio_20minAgo=c(T3ratio[1],T3ratio[2],head(T3ratio,-2)),
+         T3ratio_30minAgo=c(T3ratio[1],T3ratio[2],T3ratio[3],head(T3ratio,-3)),
+         #traffic ratio level4
+         T4ratio_10minAgo=c(T4ratio[1],head(T4ratio,-1)),
+         T4ratio_20minAgo=c(T4ratio[1],T4ratio[2],head(T4ratio,-2)),
+         T4ratio_30minAgo=c(T4ratio[1],T4ratio[2],T4ratio[3],head(T4ratio,-3))
+         ) %>%
+  mutate(delta12_gap = gap10minAgo-gap20minAgo,
+         delta23_gap = gap20minAgo-gap30minAgo,
+         delta13_gap = gap10minAgo-gap30minAgo,
+         
+         delta12ord_ratio = ord_ratio10minAgo-ord_ratio20minAgo,
+         delta23ord_ratio = ord_ratio20minAgo-ord_ratio30minAgo,
+         delta13ord_ratio = ord_ratio10minAgo-ord_ratio30minAgo,
+         
+         delta12avg_Prc = avg_Prc10minAgo-avg_Prc20minAgo,
+         delta23avg_Prc = avg_Prc20minAgo-avg_Prc30minAgo,
+         delta13avg_Prc = avg_Prc10minAgo-avg_Prc30minAgo,
+         
+         delta12T1 = T1_10minAgo-T1_20minAgo,
+         delta23T1 = T1_20minAgo-T1_30minAgo,
+         delta13T1 = T1_10minAgo-T1_30minAgo,
+         
+         delta12T2 = T2_10minAgo-T2_20minAgo,
+         delta23T2 = T2_20minAgo-T2_30minAgo,
+         delta13T2 = T2_10minAgo-T2_30minAgo,
+         
+         delta12T3 = T3_10minAgo-T3_20minAgo,
+         delta23T3 = T3_20minAgo-T3_30minAgo,
+         delta13T3 = T3_10minAgo-T3_30minAgo,
+         
+         delta12T4 = T4_10minAgo-T4_20minAgo,
+         delta23T4 = T4_20minAgo-T4_30minAgo,
+         delta13T4 = T4_10minAgo-T4_30minAgo,
+         
+         delta12_ordCnt = ordCnt10minAgo-ordCnt20minAgo,
+         delta23_ordCnt = ordCnt20minAgo-ordCnt30minAgo,
+         delta13_ordCnt = ordCnt10minAgo-ordCnt30minAgo
+         )
+  
+write.csv(TRAIN, file="TRAIN.csv", row.names=FALSE)
+#POI dataframe failed to improve xgb.Regressor
+
+
+```
+
+``` {r playGround, echo=FALSE}
+#driver <- temp %>%
+
+driver1 <- subset(order_data,driver_id=='e50827f1bfd258bab4dff0057c88fbb6')
+driver2 <- subset(order_data, driver_id == "e11f56de6170a728854d961a4d8f89ee")
+
+#construct features representing unique passenger
+passenger <- order_data %>% group_by(passenger_id) %>% summarise(psgOrdFreq = n(),psgLuck = sum(order_result)/n(),
+                                                            psgDest = sum(isLocal)/n(),
+                                                            avgJourneyCostByPsg = mean(Price))                                                                           
+
+#passenger_id:56018323b921dd2c5444f98fb45509de  made 232357 orders with ~86% success rate
+#might be bug or maybe some app working as third-party 
+
+#merge passenger data in to order_data
+order_data <- left_join(order_data,passenger, by="passenger_id")
+
+#now drivers
+     #ideas: diversity of start_districts by driver_id -> might show how unique_driver looks
+             #for costumers(one district dominating other or strong pattern of dest_district becoming a start_district... )
+             #Estimating journey time would be great: time gap between two orders by driver_id (very approx. and noisy)
+                   #use ~journey_time and destination to build a feature -> sum of 
+                                             #drivers dropping of clients grouped_by(district_id,Time_slot)
+
+             #preffered time of work by driver
+#driversComingToYou -> in a range of 30min before predicted Time_slot,
+                         #map driver_id's with dest_district_id matching the district u trying to predicted
+
+#driversArrived   -> count of driversComingToYou matching driver_id's with order_result==1
+     
+#Tricky task...  '1-2016-01-01-77'
+
+#driver <- order_data %>% group_by(driver_id) %>% summarise(drvOrdFreq = n(),
+ #                                                          drvDiversityOfdistricts = length(unique(start_district_id)),
+  #                                                         drvPopularTime = median(time),
+   #                                                        avgJourneyCostByDrv = mean(Price))
+
+
+#NA check
+fnd_NAs <- temp[rowSums(is.na(select(temp,-district_hash))) > 0,]
+#nrow(temp2) - length(unique(temp$order_id)) = 22565!
+
+###
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
